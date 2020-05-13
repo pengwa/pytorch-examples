@@ -15,8 +15,7 @@ Examples to run elastic training:
 
 ```bash
 python main.py -a resnet50 --dist-url 'tcp://127.0.0.1:FREEPORT' --dist-backend 'nccl' --multiprocessing-distributed
-  --world-size 1 --rank 0 --resume=[checkpoint-file-path] --start-epoch=[useful on restarts]
-  --batch-size=32 [imagenet-folder with train and val folders]
+  --world-size 1 --rank 0 --resume=[checkpoint-file-path] --batch-size=32 [imagenet-folder with train and val folders]
 ```
 
 ### Multiple nodes:
@@ -284,7 +283,10 @@ def main_worker(gpu, ngpus_per_node, args):
         best_acc1 = max(acc1, best_acc1)
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank % ngpus_per_node == 0):
+                and args.rank == 0):
+            # To support auto resizing, in theory we should check file existence here,
+            # to decide whether we should save checkpoint. For ImageNet sample, we save 
+            # checkpoint for every epoch, so it's fine we don't check the file here. 
             save_checkpoint({
                 'epoch': epoch + 1,
                 'arch': args.arch,
