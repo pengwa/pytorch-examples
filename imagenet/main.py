@@ -7,6 +7,7 @@ start-epoch: don't need pass since training script will load it from checkpoint.
 Pass checkpoint file full path using parameter `--resume`
 
 The program will use all gpus available on the nodes.
+There is an assumption: every node have same number of GPUs as workers.
 
 Examples to run elastic training:
 
@@ -14,7 +15,7 @@ Examples to run elastic training:
 
 
 ```bash
-python main.py -a resnet50 --dist-url 'tcp://127.0.0.1:FREEPORT' --dist-backend 'nccl' --multiprocessing-distributed
+python main.py -a resnet50 --multiprocessing-distributed
   --world-size 1 --rank 0 --resume=[checkpoint-file-path] --batch-size=32 [imagenet-folder with train and val folders]
 ```
 
@@ -22,17 +23,43 @@ python main.py -a resnet50 --dist-url 'tcp://127.0.0.1:FREEPORT' --dist-backend 
 
 Node 0:
 ```bash
-python main.py -a resnet50 --dist-url 'tcp://IP_OF_NODE0:FREEPORT' --dist-backend 'nccl' --multiprocessing-distributed
+python main.py -a resnet50 --multiprocessing-distributed
   --world-size 2 --rank 0 --resume=[checkpoint-file-path] --batch-size=32  [imagenet-folder with train and val folders]
 ```
 
 Node 1:
 ```bash
-python main.py -a resnet50 --dist-url 'tcp://IP_OF_NODE0:FREEPORT' --dist-backend 'nccl' --multiprocessing-distributed 
+python main.py -a resnet50 --multiprocessing-distributed 
   --world-size 2 --rank 1 --resume=[checkpoint-file-path] --batch-size=32  [imagenet-folder with train and val folders]
 ```
 
 '''
+
+import os
+import os.path as op
+import re
+
+# cluster awareness logic start
+def get_master_machine():
+    mpi_host_file = op.expanduser('~/mpi-hosts')
+    with open(mpi_host_file, 'r') as f:
+        master_name = f.readline().strip()
+    return master_name
+
+def get_master_ip(master_name=None):
+    if master_name is None:
+        master_name = get_master_machine()
+    etc_host_file = '/etc/hosts'
+    with open(etc_host_file, 'r') as f:
+        name_ip_pairs = f.readlines()
+    name2ip = {}
+    for name_ip_pair in name_ip_pairs:
+        pair_list = name_ip_pair.split(' ')
+        key = pair_list[1].strip()
+        value = pair_list[0]
+        name2ip[key] = value
+    return name2ip[master_name]
+# cluster awareness logic end
 
 import argparse
 import os
@@ -86,7 +113,9 @@ parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
 parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
-                    help='path to latest checkpoint (default: none)')
+                    help='path to user specified latest checkpoint (default: none)')
+parser.add_argument('--output-directory', default='', type=str,
+                    help='path to save latest checkpoint (default: none)')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
@@ -95,7 +124,7 @@ parser.add_argument('--world-size', default=-1, type=int,
                     help='number of nodes for distributed training')
 parser.add_argument('--rank', default=-1, type=int,
                     help='node rank for distributed training')
-parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
+parser.add_argument('--dist-url', default='tcp://' + get_master_ip() + ':23456',
                     help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend')
@@ -202,16 +231,23 @@ def main_worker(gpu, ngpus_per_node, args):
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay) 
 
-    # optionally resume from a checkpoint
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
+    # check previous saved checkpoint first
+    # if there is none, then resume from user specified checkpoint if there is
+    target_ckpt_path = args.output_directory + "/" + checkpoint_file_name
+    ckpt_path = target_ckpt_path
+    if not os.path.isfile(ckpt_path):
+        print("=> no checkpoint found at '{}'".format(ckpt_path))
+        ckpt_path = args.resume
+
+    if ckpt_path:
+        if os.path.isfile(ckpt_path):
+            print("=> loading checkpoint '{}'".format(ckpt_path))
             if args.gpu is None:
-                checkpoint = torch.load(args.resume)
+                checkpoint = torch.load(ckpt_path)
             else:
                 # Map model to be loaded to specified single gpu.
                 loc = 'cuda:{}'.format(args.gpu)
-                checkpoint = torch.load(args.resume, map_location=loc)
+                checkpoint = torch.load(ckpt_path, map_location=loc)
             args.start_epoch = checkpoint['epoch']
             best_acc1 = checkpoint['best_acc1']
             if args.gpu is not None:
@@ -220,12 +256,9 @@ def main_worker(gpu, ngpus_per_node, args):
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.resume, checkpoint['epoch']))
+                  .format(ckpt_path, checkpoint['epoch']))
         else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
-    else:
-        # enforce checkpoint exist for elastic-able jobs
-        raise ValueError('When enable auto resizing, checkpoint path must be provided.')
+            print("=> no checkpoint found at '{}'".format(ckpt_path))
 
     cudnn.benchmark = True
 
@@ -293,7 +326,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 'state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
                 'optimizer' : optimizer.state_dict(),
-            }, is_best, args.resume)
+            }, is_best, target_ckpt_path)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
