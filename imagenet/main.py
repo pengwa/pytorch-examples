@@ -47,8 +47,6 @@ def get_master_machine():
     return master_name
 
 def get_master_ip(master_name=None):
-    if master_name is None:
-        master_name = get_master_machine()
     etc_host_file = '/etc/hosts'
     with open(etc_host_file, 'r') as f:
         name_ip_pairs = f.readlines()
@@ -58,7 +56,16 @@ def get_master_ip(master_name=None):
         key = pair_list[1].strip()
         value = pair_list[0]
         name2ip[key] = value
-    return name2ip[master_name]
+    
+
+    ip = "127.0.0.1"
+    # only one node
+    if len(name2ip) != 1:
+        if master_name is None:
+            master_name = get_master_machine()
+        ip = name2ip[master_name]
+    return ip
+
 # cluster awareness logic end
 
 import argparse
@@ -114,8 +121,6 @@ parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to user specified latest checkpoint (default: none)')
-parser.add_argument('--output-directory', default='', type=str,
-                    help='path to save latest checkpoint (default: none)')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
@@ -158,6 +163,8 @@ def main():
     if args.gpu is not None:
         warnings.warn('You have chosen a specific GPU. This will completely '
                       'disable data parallelism.')
+
+    warnings.warn("[node rank] " + str(args.rank) + ": dis_url (master_ip:master_port) is " + args.dist_url)
 
     if args.dist_url == "env://" and args.world_size == -1:
         args.world_size = int(os.environ["WORLD_SIZE"])
@@ -231,9 +238,9 @@ def main_worker(gpu, ngpus_per_node, args):
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay) 
 
-    # check previous saved checkpoint first
+    # Firstly, check previous saved checkpoint before last elastic job retry
     # if there is none, then resume from user specified checkpoint if there is
-    target_ckpt_path = args.output_directory + "/" + checkpoint_file_name
+    target_ckpt_path = os.environ['PHILLY_MODEL_DIRECTORY'] + "/" + checkpoint_file_name
     ckpt_path = target_ckpt_path
     if not os.path.isfile(ckpt_path):
         print("=> no checkpoint found at '{}'".format(ckpt_path))
@@ -258,7 +265,7 @@ def main_worker(gpu, ngpus_per_node, args):
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(ckpt_path, checkpoint['epoch']))
         else:
-            print("=> no checkpoint found at '{}'".format(ckpt_path))
+            print("=> no initial checkpoint found at '{}'".format(ckpt_path))
 
     cudnn.benchmark = True
 
