@@ -1,3 +1,73 @@
+'''
+Description:
+
+rank: node's rank among all the nodes
+world-size: total node numbers
+start-epoch: don't need pass since training script will load it from checkpoint.
+Pass checkpoint file full path using parameter `--resume`
+
+The program will use all gpus available on the nodes.
+There is an assumption: every node have same number of GPUs as workers.
+
+Examples to run elastic training:
+
+### Single node, multiple GPUs:
+
+
+```bash
+python main.py -a resnet50 --multiprocessing-distributed
+  --world-size 1 --rank 0 --resume=[checkpoint-file-path] --batch-size=32 [imagenet-folder with train and val folders]
+```
+
+### Multiple nodes:
+
+Node 0:
+```bash
+python main.py -a resnet50 --multiprocessing-distributed
+  --world-size 2 --rank 0 --resume=[checkpoint-file-path] --batch-size=32  [imagenet-folder with train and val folders]
+```
+
+Node 1:
+```bash
+python main.py -a resnet50 --multiprocessing-distributed 
+  --world-size 2 --rank 1 --resume=[checkpoint-file-path] --batch-size=32  [imagenet-folder with train and val folders]
+```
+
+'''
+
+import os
+import os.path as op
+import re
+
+# cluster awareness logic start
+def get_master_machine():
+    mpi_host_file = op.expanduser('~/mpi-hosts')
+    with open(mpi_host_file, 'r') as f:
+        master_name = f.readline().strip()
+    return master_name
+
+def get_master_ip(master_name=None):
+    etc_host_file = '/etc/hosts'
+    with open(etc_host_file, 'r') as f:
+        name_ip_pairs = f.readlines()
+    name2ip = {}
+    for name_ip_pair in name_ip_pairs:
+        pair_list = name_ip_pair.split(' ')
+        key = pair_list[1].strip()
+        value = pair_list[0]
+        name2ip[key] = value
+    
+
+    ip = "127.0.0.1"
+    # only one node
+    if len(name2ip) != 1:
+        if master_name is None:
+            master_name = get_master_machine()
+        ip = name2ip[master_name]
+    return ip
+
+# cluster awareness logic end
+
 import argparse
 import os
 import random
@@ -36,11 +106,10 @@ parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=256, type=int,
+parser.add_argument('-b', '--batch-size', default=32, type=int,
                     metavar='N',
-                    help='mini-batch size (default: 256), this is the total '
-                         'batch size of all GPUs on the current node when '
-                         'using Data Parallel or Distributed Data Parallel')
+                    help='mini-batch size (default: 32), this is the total '
+                         'batch size of on a single GPU worker')
 parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
                     metavar='LR', help='initial learning rate', dest='lr')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
@@ -51,7 +120,7 @@ parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
 parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
-                    help='path to latest checkpoint (default: none)')
+                    help='path to user specified latest checkpoint (default: none)')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
@@ -60,7 +129,7 @@ parser.add_argument('--world-size', default=-1, type=int,
                     help='number of nodes for distributed training')
 parser.add_argument('--rank', default=-1, type=int,
                     help='node rank for distributed training')
-parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
+parser.add_argument('--dist-url', default='tcp://' + get_master_ip() + ':23456',
                     help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend')
@@ -75,7 +144,8 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'multi node data parallel training')
 
 best_acc1 = 0
-
+checkpoint_file_name="checkpoint.pth.tar"
+best_checkpoint_file_name="model_best.pth.tar"
 
 def main():
     args = parser.parse_args()
@@ -93,6 +163,8 @@ def main():
     if args.gpu is not None:
         warnings.warn('You have chosen a specific GPU. This will completely '
                       'disable data parallelism.')
+
+    warnings.warn("[node rank] " + str(args.rank) + ": dis_url (master_ip:master_port) is " + args.dist_url)
 
     if args.dist_url == "env://" and args.world_size == -1:
         args.world_size = int(os.environ["WORLD_SIZE"])
@@ -143,17 +215,11 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.gpu is not None:
             torch.cuda.set_device(args.gpu)
             model.cuda(args.gpu)
-            # When using a single GPU per process and per
-            # DistributedDataParallel, we need to divide the batch size
-            # ourselves based on the total number of GPUs we have
-            args.batch_size = int(args.batch_size / ngpus_per_node)
             args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         else:
-            model.cuda()
-            # DistributedDataParallel will divide and allocate batch_size to all
-            # available GPUs if device_ids are not set
-            model = torch.nn.parallel.DistributedDataParallel(model)
+            raise ValueError("DistributedDataParallel path using all available devices not implemented")
+
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
@@ -170,18 +236,25 @@ def main_worker(gpu, ngpus_per_node, args):
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
-                                weight_decay=args.weight_decay)
+                                weight_decay=args.weight_decay) 
 
-    # optionally resume from a checkpoint
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
+    # Firstly, check previous saved checkpoint before last elastic job retry
+    # if there is none, then resume from user specified checkpoint if there is
+    target_ckpt_path = os.environ['PHILLY_MODEL_DIRECTORY'] + "/" + checkpoint_file_name
+    ckpt_path = target_ckpt_path
+    if not os.path.isfile(ckpt_path):
+        print("=> no checkpoint found at '{}'".format(ckpt_path))
+        ckpt_path = args.resume
+
+    if ckpt_path:
+        if os.path.isfile(ckpt_path):
+            print("=> loading checkpoint '{}'".format(ckpt_path))
             if args.gpu is None:
-                checkpoint = torch.load(args.resume)
+                checkpoint = torch.load(ckpt_path)
             else:
                 # Map model to be loaded to specified single gpu.
                 loc = 'cuda:{}'.format(args.gpu)
-                checkpoint = torch.load(args.resume, map_location=loc)
+                checkpoint = torch.load(ckpt_path, map_location=loc)
             args.start_epoch = checkpoint['epoch']
             best_acc1 = checkpoint['best_acc1']
             if args.gpu is not None:
@@ -190,9 +263,9 @@ def main_worker(gpu, ngpus_per_node, args):
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.resume, checkpoint['epoch']))
+                  .format(ckpt_path, checkpoint['epoch']))
         else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
+            print("=> no initial checkpoint found at '{}'".format(ckpt_path))
 
     cudnn.benchmark = True
 
@@ -250,14 +323,17 @@ def main_worker(gpu, ngpus_per_node, args):
         best_acc1 = max(acc1, best_acc1)
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank % ngpus_per_node == 0):
+                and args.rank == 0):
+            # To support auto resizing, in theory we should check file existence here,
+            # to decide whether we should save checkpoint. For ImageNet sample, we save 
+            # checkpoint for every epoch, so it's fine we don't check the file here. 
             save_checkpoint({
                 'epoch': epoch + 1,
                 'arch': args.arch,
                 'state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
                 'optimizer' : optimizer.state_dict(),
-            }, is_best)
+            }, is_best, target_ckpt_path)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -349,11 +425,13 @@ def validate(val_loader, model, criterion, args):
 
     return top1.avg
 
-
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-    torch.save(state, filename)
+import tempfile
+def save_checkpoint(state, is_best, filename):
+    new_file, tmp_filename = tempfile.mkstemp()
+    torch.save(state, tmp_filename)
+    shutil.move(tmp_filename, filename)
     if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
+        shutil.copyfile(filename, os.path.dirname(filename) + "/" + best_checkpoint_file_name)
 
 
 class AverageMeter(object):
